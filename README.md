@@ -1,228 +1,176 @@
-# Native Immich
+# immich-native-android
 
-This repository provides instructions and helper scripts to install [Immich](https://github.com/immich-app/immich) without Docker, natively.
+> **Run Immich on Android — no Docker, no root, no cloud.**
 
-### Notes
+[Immich](https://github.com/immich-app/immich) is a self-hosted photo/video backup platform designed to run on Linux servers via Docker. This project ports it to a stock Android phone using Termux, solving every compatibility layer from scratch.
 
- * This is tested on Ubuntu 24.04 (on both x86 and aarch64) as the host distro, but it will be similar on other distros. If you want to run this on a macOS, see [4v3ngR's unofficial macOS port](https://github.com/4v3ngR/immich-native-macos).
+**Tested on:** Samsung Galaxy S25 (Snapdragon 8 Elite, aarch64, Android 15)  
+**Immich version:** v2.5.6  
+**Base:** adapted from [arter97/immich-native](https://github.com/arter97/immich-native), then heavily reworked for Android/Bionic
 
- * This guide installs Immich to `/var/lib/immich`. To change it, replace it to the directory you want in this README, `install.sh`, `immich.service`, `immich-machine-learning.service`.
+---
 
- * The [install.sh](install.sh) script currently is using Immich v2.6.3. It should be noted that due to the fast-evolving nature of Immich, the install script may get broken if you replace the `$REV` to something more recent.
+## Why this is hard
 
- * `mimalloc` is deliberately disabled as this is a native install and sharing system library makes more sense.
+Android is not Linux. It uses Bionic libc instead of glibc, has no FHS filesystem layout, no systemd, no root, no FUSE mounts, and kills background processes aggressively. Immich was never designed to run here. Every single layer of the stack required fixes.
 
- * Machine-learning's host is opened to 0.0.0.0 in the default configuration. This behavior is changed to only accept 127.0.0.1 during installation.
+---
 
- * Only the basic CPU configuration is used. Hardware-acceleration such as CUDA is unsupported. In my personal experience, importing about 10K photos on a x86 processor doesn't take an unreasonable amount of time (less than 30 minutes).
+## Architecture
 
- * JPEG XL/RAW support may differ official Immich due to base-image's dependency differences.
+```
+proot Debian (container)
+└── PostgreSQL 17 + VectorChord extension
+        ↓ localhost:5432
+Termux (native aarch64)
+├── Redis
+├── Node.js 20  →  Immich server      (port 2283)
+└── Python + ONNX  →  Immich ML       (port 3003)
+```
 
- * For HEIF support, see [below](#HEIF-Support).
+**Optional:** WebDAV external library support — index photos on a remote NAS without copying them locally.
 
-## 1. Install dependencies
+---
 
- * [Node.js](https://nodesource.com/products/distributions)
+## Problems solved
 
-You need corepack enabled to use pnpm.
+This is not a tutorial repackage. These are the actual blockers encountered and how they were resolved.
+
+### 1. Node.js version incompatibility
+The latest Node.js caused silent startup failures. Traced to native module ABI mismatches between Node versions and prebuilt binaries compiled against glibc. Solution: pinned to Node 20 LTS, which has stable arm64 prebuilts compatible with Bionic via the `npm_config_platform=linux` workaround.
+
+### 2. Native dependencies — manual recompilation
+Most npm packages ship Linux/glibc prebuilts that silently fail or crash on Android/Bionic. Sharp (image processing) and bcrypt required full recompilation from source against Termux's libvips. Python ML dependencies (ONNX Runtime, InsightFace) had no Android wheels — compiled inside a Python venv using Rust-based build tools (`maturin`, `uv`). `watchfiles` was removed entirely (requires Rust/maturin, incompatible with Android's Bionic).
+
+Key environment flags that made this work:
+```bash
+npm_config_platform=linux          # tricks Sharp into using linux-arm64 prebuilts
+npm_config_libc=glibc              # same
+SHARP_FORCE_GLOBAL_LIBVIPS=1       # links Termux's libvips instead of bundled
+NODE_OPTIONS=--max-old-space-size=6144  # prevents OOM during build
+TMPDIR=$HOME/tmp                   # /tmp is read-only on Android
+```
+
+### 3. PostgreSQL — proot Debian isolation
+PostgreSQL cannot run natively in Termux (missing kernel features, libc incompatibilities). Solution: run it inside a proot Debian container. However, PostgreSQL crashes when started as root inside proot. Fixed by creating a dedicated `postgres` user inside the container and launching the service under that user via a scripted proot session.
+
+### 4. WebDAV external library — Immich source patch
+The goal: index photos stored on a remote NAS without copying them to the phone.
+
+The problem: Android has no FUSE support without root, so the NAS cannot be mounted as a filesystem path. The only working option (RSAF) exposes files through Android's Storage Access Framework — inaccessible from Termux.
+
+The solution: patch Immich's source code directly. `StorageRepository` and `LibraryService` validate external library paths using `path.isAbsolute()`, which rejects HTTP URLs. Added bypass logic for paths starting with `http://` before the TypeScript build, and a post-build patch on the compiled JS as fallback.
+
+```typescript
+// patch applied to LibraryService before build
+if (importPath.startsWith('http://')) {
+  // WebDAV path — skip isAbsolute() check
+}
+```
+
+The NAS serves files over WebDAV via `rclone serve webdav` over Tailscale.
+
+### 5. ML library recompilation
+Immich's machine learning service (face recognition, CLIP embeddings, smart search) depends on native Python extensions. None had Android/aarch64 wheels. Each was compiled manually inside the venv using:
+```bash
+uv sync --python-platform manylinux_2_28_aarch64
+```
+InsightFace was removed from `pyproject.toml` and installed separately via pip after the main sync, due to build order conflicts.
+
+### 6. Phantom Process Killer
+Android 12+ kills background processes not started by the foreground app. Immich (PostgreSQL + Redis + Node + Python) runs as four separate processes. Fixed via Shizuku + ADB:
+```bash
+adb shell device_config set_sync_disabled_for_tests persistent
+adb shell device_config put activity_manager max_phantom_processes 2147483647
+```
+
+---
+
+## Installation
+
+> ⚠️ This setup is complex and environment-sensitive. It requires Termux, proot-distro with Debian, and approximately 30–90 minutes of build time. Keep the phone charging and on WiFi.
+
+### Prerequisites
+- Android 12+ (tested on Android 15)
+- [Termux](https://f-droid.org/packages/com.termux/) from F-Droid
+- proot-distro with Debian installed
+- Shizuku (recommended — prevents process killing)
+- ~8GB free storage
+
+### Steps
 
 ```bash
-sudo npm install npm@latest -g
-sudo npm install corepack@latest -g
-sudo corepack enable
+# 1. PostgreSQL inside proot Debian
+cp 01_setup_postgres.sh /sdcard/
+proot-distro login debian -- bash /sdcard/01_setup_postgres.sh
+# Save the generated DB_PASSWORD
+
+# 2. Termux native dependencies
+chmod +x installdepstermux.sh && ./installdepstermux.sh
+
+# 3. Configure environment
+mkdir -p ~/immich && cp env ~/immich/env
+nano ~/immich/env  # set DB_PASSWORD from step 1
+
+# 4. Build Immich (~30–90 min)
+chmod +x install.sh webdav_patch.sh
+./install.sh 2>&1 | tee ~/install_log.txt
+
+# 5. Start
+chmod +x start_immich.sh && ./start_immich.sh
 ```
 
- * [PostgreSQL](https://www.postgresql.org/download/linux)
+Open: **http://localhost:2283**
 
- * [Redis](https://redis.io/docs/latest/operate/oss_and_stack/install/archive/install-redis/install-redis-on-linux)
+---
 
-As the time of writing, Node.js v24 LTS, PostgreSQL 18 and Redis 8.4.0 was used.
+## WebDAV external library (optional)
 
- * [pgvector](https://github.com/pgvector/pgvector)
+Allows Immich to index photos on a remote NAS without local copies — no FUSE, no root.
 
-pgvector is included in the official PostgreSQL's APT repository:
-
-``` bash
-sudo apt install postgresql(-18)-pgvector
+**On the NAS (Termux):**
+```bash
+rclone serve webdav /sdcard/YourFolder --addr 0.0.0.0:8080 --read-only &
 ```
 
- * [VectorChord](https://docs.vectorchord.ai/vectorchord/getting-started/installation.html)
+**In Immich UI:**  
+`Administration → External Libraries → Add → http://NAS_IP:8080/`
 
- * [FFmpeg](https://github.com/FFmpeg/FFmpeg)
+The WebDAV patch is applied automatically during `install.sh`.
 
-Immich uses FFmpeg to process media.
+---
 
-FFmpeg provided by the distro is typically too old.
-Either install it from [jellyfin](https://github.com/jellyfin/jellyfin-ffmpeg/releases)
-or use [FFmpeg Static Builds](https://johnvansickle.com/ffmpeg) and install it to `/usr/bin`.
+## Known limitations
 
-Adding [Jellyfin APT repository](https://jellyfin.org/downloads/server) will automatically provide updates.
-Follow the instructions and press Control+C when `jellyfin` package is about to get installed to abort.
-You only need the repository, not the `jellyfin` package itself.
-After that, install `jellyfin-ffmpeg7`:
+- ML (face recognition, smart search) stability depends on native module compatibility — works on this setup, may vary
+- Immich updates require re-running `install.sh`
+- No GPU/NPU acceleration — all ML runs on CPU
+- Shizuku must be re-enabled after each reboot
+- WebDAV library scanning can be slow on first run (thumbnail generation for large libraries)
 
-``` bash
-sudo apt install jellyfin-ffmpeg7
-```
+---
 
-### Other APT packages
+## Files
 
-``` bash
-sudo apt install --no-install-recommends \
-        python3-pip \
-        python3-venv \
-        python3-dev \
-        uuid-runtime \
-        autoconf \
-        build-essential \
-        unzip \
-        jq \
-        perl \
-        libnet-ssleay-perl \
-        libio-socket-ssl-perl \
-        libcapture-tiny-perl \
-        libfile-which-perl \
-        libfile-chdir-perl \
-        libpkgconfig-perl \
-        libffi-checklib-perl \
-        libtest-warnings-perl \
-        libtest-fatal-perl \
-        libtest-needs-perl \
-        libtest2-suite-perl \
-        libsort-versions-perl \
-        libpath-tiny-perl \
-        libtry-tiny-perl \
-        libterm-table-perl \
-        libany-uri-escape-perl \
-        libmojolicious-perl \
-        libfile-slurper-perl \
-        liblcms2-2 \
-        wget \
-        libgl1
-```
+| File | Purpose |
+|------|---------|
+| `01_setup_postgres.sh` | PostgreSQL 17 + VectorChord inside proot Debian |
+| `installdepstermux.sh` | All native Termux dependencies |
+| `install.sh` | Full Immich build pipeline with all Android fixes |
+| `webdav_patch.sh` | Patches Immich TypeScript source for WebDAV support |
+| `webdav_postbuild.sh` | Post-build JS patch (fallback) |
+| `start_immich.sh` / `stop_immich.sh` | Service management |
+| `env` | Environment configuration template |
 
-A separate Python's virtualenv will be stored to `/var/lib/immich`.
+---
 
-## 2. Prepare `immich` user
+## Credits
 
-This guide isolates Immich to run on a separate `immich` user.
+- [arter97/immich-native](https://github.com/arter97/immich-native) — original non-Docker install approach
+- [immich-app/immich](https://github.com/immich-app/immich) — the application
 
-This provides basic permission isolation and protection.
+---
 
-``` bash
-sudo adduser \
-  --home /var/lib/immich/home \
-  --shell=/sbin/nologin \
-  --no-create-home \
-  --disabled-password \
-  --disabled-login \
-  immich
-sudo mkdir -p /var/lib/immich
-sudo chown immich:immich /var/lib/immich
-sudo chmod 700 /var/lib/immich
-```
+## License
 
-## 3. Prepare PostgreSQL DB
-
-Create a strong random string to be used with PostgreSQL immich database.
-
-You need to save this and write to the `env` file later.
-
-``` bash
-sudo -u postgres psql
-postgres=# create database immich;
-postgres=# create user immich with encrypted password 'YOUR_STRONG_RANDOM_PW';
-postgres=# grant all privileges on database immich to immich;
-postgres=# ALTER USER immich WITH SUPERUSER;
-postgres=# CREATE EXTENSION IF NOT EXISTS vchord CASCADE;
-postgres=# \q
-
-sudo -u immich psql -U immich
-postgres=# CREATE EXTENSION IF NOT EXISTS vchord CASCADE;
-postgres=# \q
-```
-
-## 4. Prepare `env`
-
-Save the [env](env) file to `/var/lib/immich`, and configure on your own.
-
-You'll only have to set `DB_PASSWORD`.
-
-``` bash
-sudo cp env /var/lib/immich
-sudo chown immich:immich /var/lib/immich/env
-sudo chmod 600 /var/lib/immich/env
-```
-
-## 5. Build and install Immich
-
-Clone this repository to somewhere anyone can access (like /tmp) and run `install.sh` as root.
-
-Anytime Immich is updated, all you have to do is run it again.
-
-In summary, the `install.sh` script does the following:
-
-#### 1. Clones and builds Immich.
-
-#### 2. Installs Immich to `/var/lib/immich` with minor patches.
-
-  * Sets up a dedicated Python venv to `/var/lib/immich/app/machine-learning/venv`.
-
-  * Replaces `/usr/src` to `/var/lib/immich`.
-
-  * Limits listening host from 0.0.0.0 to 127.0.0.1. If you do not want this to happen (make sure you fully understand the security risks!), change `IMMICH_HOST=127.0.0.1` to `IMMICH_HOST=0.0.0.0` from the `env` file.
-
-## Done!
-
-Your Immich installation should be running at 2283 port, listening from localhost (127.0.0.1).
-
-Immich will additionally use localhost's 3003 ports.
-
-Please add firewall rules and [apply https proxy](https://docs.immich.app/administration/reverse-proxy) and secure your Immich instance.
-
-## Uninstallation
-
-``` bash
-# Run as root!
-
-# Remove Immich systemd services
-systemctl list-unit-files --type=service | grep "^immich" | while read i unused; do
-  systemctl stop $i
-  systemctl disable $i
-done
-rm /lib/systemd/system/immich*.service
-systemctl daemon-reload
-
-# Remove Immich files
-rm -rf /var/lib/immich
-
-# Delete immich user
-deluser immich
-
-# Remove Immich DB
-sudo -u postgres psql
-postgres=# drop database immich;
-postgres=# drop user immich;
-postgres=# \q
-
-# Optionally remove dependencies
-# Review /var/log/apt/history.log and remove packages you've installed
-```
-
-## HEIF Support
-
- * Apple devices use HEIF images instead of JPG.
-
- * Immich supports HEIF but installing it natively requires building [Sharp](https://github.com/lovell/sharp) from source.
-
- * Building Sharp from source in turn requires the latest `libvips-dev` to be installed.
-
- * For Ubuntu, see my [arter97/libvips PPA](https://launchpad.net/~arter97/+archive/ubuntu/libvips) to install the latest `libvips`:
-
-``` bash
-sudo add-apt-repository ppa:arter97/libvips
-sudo apt install libvips-dev libraw-dev
-sudo apt remove libvips*t64
-```
-
- * If you installed the latest `libvips-dev`, the install script will detect this automatically and proceed to install Sharp from source.
+MIT

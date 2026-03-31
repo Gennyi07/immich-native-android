@@ -11,12 +11,6 @@ APP="$IMMICH_PATH/app"
 LOG_DIR="$IMMICH_PATH/logs"
 PID_DIR="$IMMICH_PATH/pids"
 
-# --- Percorso della galleria NAS (RSAF/SAF bridge) ---
-# Dopo aver configurato RSAF, inserisci qui il percorso POSIX
-# che Termux vede per la cartella remota del NAS.
-# Esempio: /storage/emulated/0/RSAF/BackupS25/gallery
-# o il percorso restituito da termux-saf-managedir
-NAS_GALLERY_PATH="${IMMICH_NAS_PATH:-/storage/emulated/0/RSAF/BackupS25/gallery}"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
@@ -34,7 +28,6 @@ proot-distro login debian --user root -- bash -c \
 echo "[1/4] Avvio PostgreSQL in proot Debian..."
 # =============================================================================
 proot-distro login debian \
-    --bind "$NAS_GALLERY_PATH:/mnt/nas_gallery" \
     -- bash -c "
         su -s /bin/bash postgres -c \
         '/usr/lib/postgresql/${PG_VERSION}/bin/pg_ctl \
@@ -93,7 +86,7 @@ echo "  Web UI:  http://$(hostname -I | awk '{print $1}'):2283"
 echo "  Log:     $LOG_DIR/"
 echo ""
 echo "⚠️  Ricorda:"
-echo "  - Configura External Library in Admin UI"
-echo "    puntando a /mnt/nas_gallery"
+echo "  - Configura External Library in Admin UI"    
 echo "  - Per fermare: ./stop_immich.sh"
 echo "============================================"
+ 

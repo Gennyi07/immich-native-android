@@ -2,6 +2,8 @@
 
 > **Run Immich on Android — no Docker, no root, no cloud.**
 
+Code written entirely by Anthropic models 
+
 [Immich](https://github.com/immich-app/immich) is a self-hosted photo/video backup platform designed to run on Linux servers via Docker. This project ports it to a stock Android phone using Termux, solving every compatibility layer from scratch.
 
 **Tested on:** Samsung Galaxy S25 (Snapdragon 8 Elite, aarch64, Android 15)  
